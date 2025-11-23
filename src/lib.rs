@@ -1,7 +1,13 @@
 use std::fs::File;
 use std::path::Path;
-use std::time::Instant;
+// Use a wasm-friendly Instant on the web, std Instant elsewhere
+#[cfg(target_arch = "wasm32")]
+use instant::Instant as AppInstant;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant as AppInstant;
 use std::sync::Arc;
+#[cfg(target_arch="wasm32")]
+use std::io::Cursor;
 use bytemuck::{Pod, Zeroable};
 use glyphon::{FontSystem, SwashCache, TextAtlas, TextRenderer, Metrics, Attrs, Family, Shaping, Resolution, TextArea, TextBounds, Cache};
 use wgpu::{Backends, MultisampleState, RenderPass};
@@ -16,8 +22,36 @@ use winit::{
     window::{WindowId},
 };
 use winit::dpi::PhysicalPosition;
+
+// On wasm we must not block the main thread or use thread-based primitives.
+// We'll initialize GPU state asynchronously and stash it in a thread-local
+// until the winit event loop can pick it up.
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static GLOBAL_STATE: std::cell::RefCell<Option<State>> = const { std::cell::RefCell::new(None) };
+}
 use winit::event::MouseScrollDelta::LineDelta;
 use winit::window::Window;
+
+// Ensure we always have at least one usable font (especially on wasm where
+// system fonts are unavailable). We bundle Noto Sans Regular and load system
+// fonts on native as well for broader coverage.
+fn init_font_system() -> FontSystem {
+    let mut fs = FontSystem::new();
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // Try to load OS fonts on native; ignore if unavailable.
+        fs.db_mut().load_system_fonts();
+    }
+
+    // Load bundled fallback (always), so wasm has a font and native has a
+    // deterministic fallback if system fonts are missing.
+    let data = include_bytes!("../assets/fonts/static/NotoSans-Regular.ttf").to_vec();
+    let _ = fs.db_mut().load_font_data(data);
+
+    fs
+}
 
 #[derive(Default, Copy, Clone)]
 struct PlotMetadata {
@@ -72,10 +106,10 @@ struct State {
     last_cursor_position: PhysicalPosition<f64>,
     last_left_click_screen_position: PhysicalPosition<f64>,
     current_left_mouse_state: ElementState,
-    left_mouse_last_transition_time: Instant,
-    left_mouse_last_quick_click_time: Instant,
+    left_mouse_last_transition_time: AppInstant,
+    left_mouse_last_quick_click_time: AppInstant,
     current_right_mouse_state: ElementState,
-    right_mouse_last_transition_time: Instant,
+    right_mouse_last_transition_time: AppInstant,
     window: Arc<Window>,
 }
 
@@ -104,10 +138,9 @@ impl State {
         let (device, queue) = adapter.request_device(
             &wgpu::DeviceDescriptor {
                 required_features: wgpu::Features::empty(),
-                // WebGL doesn't support all of wgpu's features, so if
-                // we're building for the web, we'll have to disable some.
+                // On WebGPU (wasm32), avoid constraining to WebGL2 limits; use downlevel defaults for portability.
                 required_limits: if cfg!(target_arch = "wasm32") {
-                    wgpu::Limits::downlevel_webgl2_defaults()
+                    wgpu::Limits::downlevel_defaults()
                 } else {
                     wgpu::Limits::default()
                 },
@@ -211,7 +244,7 @@ impl State {
         };
         surface.configure(&device, &config);
 
-        let mut font_system = FontSystem::new();
+        let mut font_system = init_font_system();
         let mut text_cache = SwashCache::new();
         let mut cache = Cache::new(&device);
         let mut text_atlas = TextAtlas::new(&device, &queue, &cache, surface_format);
@@ -219,7 +252,12 @@ impl State {
         let mut text_buffer = glyphon::Buffer::new(&mut font_system, Metrics::new(30.0, 42.0));
 
         text_buffer.set_size(&mut font_system, Some(size.width as f32), Some(size.height as f32));
-        text_buffer.set_text(&mut font_system, "Hello world! 👋\nThis is rendered with 🦅 glyphon 🦁\nThe text below should be partially clipped.\na b c d e f g h i j k l m n o p q r s t u v w x y z", &Attrs::new().family(Family::SansSerif), Shaping::Advanced);
+        text_buffer.set_text(
+            &mut font_system,
+            "Hello world! 👋\nThis is rendered with 🦅 glyphon 🦁\nThe text below should be partially clipped.\na b c d e f g h i j k l m n o p q r s t u v w x y z",
+            &Attrs::new().family(Family::Name("Noto Sans")),
+            Shaping::Advanced,
+        );
 
         text_buffer.shape_until_scroll(&mut font_system, false);
 
@@ -362,17 +400,29 @@ impl State {
             last_cursor_position: Default::default(),
             last_left_click_screen_position: Default::default(),
             current_left_mouse_state: ElementState::Released,
-            left_mouse_last_transition_time: Instant::now(),
-            left_mouse_last_quick_click_time: Instant::now(),
+            left_mouse_last_transition_time: AppInstant::now(),
+            left_mouse_last_quick_click_time: AppInstant::now(),
             current_right_mouse_state: ElementState::Released,
-            right_mouse_last_transition_time: Instant::now(),
+            right_mouse_last_transition_time: AppInstant::now(),
         }
     }
 
     fn load_data(&mut self) {
-        let path = Path::new("data.csv");
-        let file = File::open(path).unwrap();
-        let mut rdr = csv::ReaderBuilder::new().has_headers(true).delimiter(b',').from_reader(file);
+        // CSV reader source differs between native and wasm32 (no filesystem on the web)
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut rdr = {
+            let path = Path::new("data.csv");
+            let file = File::open(path).unwrap();
+            csv::ReaderBuilder::new().has_headers(true).delimiter(b',').from_reader(file)
+        };
+
+        #[cfg(target_arch = "wasm32")]
+        let mut rdr = {
+            // Embed the CSV at compile time for the web build to avoid fetch/setup complexity initially.
+            let bytes: &[u8] = include_bytes!("../data.csv");
+            let cursor = Cursor::new(bytes);
+            csv::ReaderBuilder::new().has_headers(true).delimiter(b',').from_reader(cursor)
+        };
         let mut plot_metadata = PlotMetadata{
             min_x: 0f32,
             max_x: 0f32,
@@ -468,7 +518,7 @@ impl State {
                                     self.plot_view_frame_value.view_min_y = self.latest_plot_metadata.min_y;
                                     self.plot_view_frame_value.view_max_y = self.latest_plot_metadata.max_y;
                                 }
-                                self.left_mouse_last_quick_click_time = Instant::now();
+                                self.left_mouse_last_quick_click_time = AppInstant::now();
                             }
                             if self.left_mouse_last_transition_time.elapsed().as_millis() > 200 {
                                 // Zoom X to selected region
@@ -485,12 +535,12 @@ impl State {
                             self.last_left_click_screen_position = self.last_cursor_position;
                         }
                         self.current_left_mouse_state = *mouse_state;
-                        self.left_mouse_last_transition_time = Instant::now();
+                        self.left_mouse_last_transition_time = AppInstant::now();
                         return true;
                     }
                     MouseButton::Right => {
                         self.current_right_mouse_state = *mouse_state;
-                        self.right_mouse_last_transition_time = Instant::now();
+                        self.right_mouse_last_transition_time = AppInstant::now();
                         return true;
                     }
                     _ => {}
@@ -632,11 +682,13 @@ pub fn insert_canvas_and_create_log_list(window: &Window) -> web_sys::Element {
 
 struct App {
     state: Option<State>,
+    // Prevent repeated window creation on wasm while async init is pending
+    initialized: bool,
 }
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.state.is_none() {
+        if !self.initialized {
             let window_attributes = Window::default_attributes();
             
             #[cfg(target_arch = "wasm32")]
@@ -653,9 +705,28 @@ impl ApplicationHandler for App {
                 let _ = window.request_inner_size(PhysicalSize::new(1024, 1024));
             }
 
-            let mut state = pollster::block_on(State::new(window));
-            state.load_data();
-            self.state = Some(state);
+            #[cfg(target_arch = "wasm32")]
+            {
+                // Async initialize State without blocking the single-threaded wasm main thread.
+                let window_clone = window.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    let mut state = State::new(window_clone.clone()).await;
+                    state.load_data();
+                    GLOBAL_STATE.with(|cell| {
+                        *cell.borrow_mut() = Some(state);
+                    });
+                    // Kick a redraw once ready
+                    window_clone.request_redraw();
+                });
+            }
+
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let mut state = pollster::block_on(State::new(window));
+                state.load_data();
+                self.state = Some(state);
+            }
+            self.initialized = true;
         }
     }
 
@@ -665,6 +736,17 @@ impl ApplicationHandler for App {
         window_id: WindowId,
         event: WindowEvent,
     ) {
+        // On wasm, async init may complete after the window starts emitting events.
+        // Try to claim the prepared State if we don't have it yet.
+        if self.state.is_none() {
+            #[cfg(target_arch = "wasm32")]
+            {
+                if let Some(state) = GLOBAL_STATE.with(|cell| cell.borrow_mut().take()) {
+                    self.state = Some(state);
+                }
+            }
+        }
+
         if let Some(state) = &mut self.state {
             if window_id == state.window.id() && !state.input(&event) {
                  match event {
@@ -704,6 +786,6 @@ pub async fn run() {
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(ControlFlow::Poll);
     
-    let mut app = App { state: None };
+    let mut app = App { state: None, initialized: false };
     event_loop.run_app(&mut app).unwrap();
 }
