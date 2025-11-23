@@ -1,21 +1,22 @@
 use std::fs::File;
 use std::path::Path;
 use std::time::Instant;
+use std::sync::Arc;
 use bytemuck::{Pod, Zeroable};
-use glyphon::{FontSystem, SwashCache, TextAtlas, TextRenderer, Metrics, Attrs, Family, Shaping, Resolution, TextArea, TextBounds};
+use glyphon::{FontSystem, SwashCache, TextAtlas, TextRenderer, Metrics, Attrs, Family, Shaping, Resolution, TextArea, TextBounds, Cache};
 use wgpu::{Backends, MultisampleState, RenderPass};
 use wgpu::util::DeviceExt;
 #[cfg(target_arch="wasm32")]
 use wasm_bindgen::prelude::*;
 
 use winit::{
+    application::ApplicationHandler,
     event::*,
-    event_loop::{ControlFlow, EventLoop},
-    window::WindowBuilder,
+    event_loop::{ControlFlow, EventLoop, ActiveEventLoop},
+    window::{WindowId},
 };
 use winit::dpi::PhysicalPosition;
 use winit::event::MouseScrollDelta::LineDelta;
-
 use winit::window::Window;
 
 #[derive(Default, Copy, Clone)]
@@ -46,8 +47,8 @@ struct Vertex {
     position: [f32; 2]
 }
 
-struct State<'window> {
-    surface: wgpu::Surface<'window>,
+struct State {
+    surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
@@ -66,21 +67,31 @@ struct State<'window> {
     font_system: FontSystem,
     text_atlas: TextAtlas,
     text_cache: SwashCache,
+    glyphon_viewport: glyphon::Viewport,
+    // Input state moved from run()
+    last_cursor_position: PhysicalPosition<f64>,
+    last_left_click_screen_position: PhysicalPosition<f64>,
+    current_left_mouse_state: ElementState,
+    left_mouse_last_transition_time: Instant,
+    left_mouse_last_quick_click_time: Instant,
+    current_right_mouse_state: ElementState,
+    right_mouse_last_transition_time: Instant,
+    window: Arc<Window>,
 }
 
-impl State<'_> {
+impl State {
     // Creating some of the wgpu types requires async code
-    async fn new<'window>(window: &'window Window) -> State<'window> {
+    async fn new(window: Arc<Window>) -> State {
         let size = window.inner_size();
 
         // The instance is a handle to our GPU
         // Backends::all => Vulkan + Metal + DX12 + Browser WebGPU
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
             ..Default::default()
         });
 
-        let surface = instance.create_surface(window).unwrap();
+        let surface = instance.create_surface(window.clone()).unwrap();
 
         let adapter = instance.request_adapter(
             &wgpu::RequestAdapterOptions {
@@ -101,8 +112,8 @@ impl State<'_> {
                     wgpu::Limits::default()
                 },
                 label: None,
+                .. Default::default()
             },
-            None, // Trace path
         ).await.unwrap();
 
         const VERTICES: &[Vertex] = &[
@@ -202,13 +213,15 @@ impl State<'_> {
 
         let mut font_system = FontSystem::new();
         let mut text_cache = SwashCache::new();
-        let mut text_atlas = TextAtlas::new(&device, &queue, surface_format);
+        let mut cache = Cache::new(&device);
+        let mut text_atlas = TextAtlas::new(&device, &queue, &cache, surface_format);
         let mut text_renderer = TextRenderer::new(&mut text_atlas, &device, MultisampleState::default(), None);
         let mut text_buffer = glyphon::Buffer::new(&mut font_system, Metrics::new(30.0, 42.0));
 
-        text_buffer.set_size(&mut font_system, size.width as f32, size.height as f32);
-        text_buffer.set_text(&mut font_system, "Hello world! 👋\nThis is rendered with 🦅 glyphon 🦁\nThe text below should be partially clipped.\na b c d e f g h i j k l m n o p q r s t u v w x y z", Attrs::new().family(Family::SansSerif), Shaping::Advanced);
-        text_buffer.shape_until_scroll(&mut font_system);
+        text_buffer.set_size(&mut font_system, Some(size.width as f32), Some(size.height as f32));
+        text_buffer.set_text(&mut font_system, "Hello world! 👋\nThis is rendered with 🦅 glyphon 🦁\nThe text below should be partially clipped.\na b c d e f g h i j k l m n o p q r s t u v w x y z", &Attrs::new().family(Family::SansSerif), Shaping::Advanced);
+
+        text_buffer.shape_until_scroll(&mut font_system, false);
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Shader"),
@@ -225,11 +238,13 @@ impl State<'_> {
         });
 
         let plot_render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            cache: None,
             label: Some("Plot Render Pipeline"),
             layout: Some(&render_pipeline_layout),
             vertex: wgpu::VertexState {
+                compilation_options: Default::default(),
                 module: &shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
                 buffers: &[
                     wgpu::VertexBufferLayout {
                         array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
@@ -245,8 +260,9 @@ impl State<'_> {
                 ]
             },
             fragment: Some(wgpu::FragmentState {
+                compilation_options: Default::default(),
                 module: &shader,
-                entry_point: "fs_main",
+                entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: config.format,
                     blend: Some(wgpu::BlendState::REPLACE),
@@ -272,11 +288,13 @@ impl State<'_> {
         });
 
         let grid_render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            cache: None,
             label: Some("Grid Render Pipeline"),
             layout: Some(&render_pipeline_layout),
             vertex: wgpu::VertexState {
+                compilation_options: Default::default(),
                 module: &shader,
-                entry_point: "vs_grid",
+                entry_point: Some("vs_grid"),
                 buffers: &[
                     wgpu::VertexBufferLayout {
                         array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
@@ -292,8 +310,9 @@ impl State<'_> {
                 ]
             },
             fragment: Some(wgpu::FragmentState {
+                compilation_options: Default::default(),
                 module: &shader,
-                entry_point: "fs_grid",
+                entry_point: Some("fs_grid"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: config.format,
                     blend: Some(wgpu::BlendState::REPLACE),
@@ -319,6 +338,8 @@ impl State<'_> {
         });
 
         State {
+            glyphon_viewport: glyphon::Viewport::new(&device, &cache),
+            window,
             surface,
             device,
             queue,
@@ -337,7 +358,14 @@ impl State<'_> {
             text_buffer,
             font_system,
             text_atlas,
-            text_cache
+            text_cache,
+            last_cursor_position: Default::default(),
+            last_left_click_screen_position: Default::default(),
+            current_left_mouse_state: ElementState::Released,
+            left_mouse_last_transition_time: Instant::now(),
+            left_mouse_last_quick_click_time: Instant::now(),
+            current_right_mouse_state: ElementState::Released,
+            right_mouse_last_transition_time: Instant::now(),
         }
     }
 
@@ -418,24 +446,86 @@ impl State<'_> {
     }
 
     fn input(&mut self, event: &WindowEvent) -> bool {
+        match event {
+            WindowEvent::MouseWheel{delta, ..} => {
+                if let LineDelta(_x, y) = delta {
+                    let middle = (self.plot_view_frame_value.view_min_x + self.plot_view_frame_value.view_max_x) / 2.0;
+                    let span = (self.plot_view_frame_value.view_max_x - self.plot_view_frame_value.view_min_x) / 2.0;
+                    let new_span = span * (1.0 - (*y/20f32));
+                    self.plot_view_frame_value.view_min_x = middle - new_span;
+                    self.plot_view_frame_value.view_max_x = middle + new_span;
+                    return true;
+                }
+            }
+            WindowEvent::MouseInput{state: mouse_state, button, ..} => {
+                match button {
+                    MouseButton::Left => {
+                        if *mouse_state == ElementState::Released {
+                            if self.left_mouse_last_transition_time.elapsed().as_millis() < 200 {
+                                if self.left_mouse_last_quick_click_time.elapsed().as_millis() < 500 {
+                                    self.plot_view_frame_value.view_min_x = self.latest_plot_metadata.min_x;
+                                    self.plot_view_frame_value.view_max_x = self.latest_plot_metadata.max_x;
+                                    self.plot_view_frame_value.view_min_y = self.latest_plot_metadata.min_y;
+                                    self.plot_view_frame_value.view_max_y = self.latest_plot_metadata.max_y;
+                                }
+                                self.left_mouse_last_quick_click_time = Instant::now();
+                            }
+                            if self.left_mouse_last_transition_time.elapsed().as_millis() > 200 {
+                                // Zoom X to selected region
+                                let start_x_fraction = self.last_left_click_screen_position.x / self.size.width as f64;
+                                let end_x_fraction = self.last_cursor_position.x / self.size.width as f64;
+                                let x_span = self.plot_view_frame_value.view_max_x - self.plot_view_frame_value.view_min_x;
+                                let start_x = start_x_fraction * x_span as f64 + self.plot_view_frame_value.view_min_x as f64;
+                                let end_x = end_x_fraction * x_span as f64 + self.plot_view_frame_value.view_min_x as f64;
+                                self.plot_view_frame_value.view_min_x = start_x as f32;
+                                self.plot_view_frame_value.view_max_x = end_x as f32;
+                            }
+                        }
+                        if *mouse_state == ElementState::Pressed {
+                            self.last_left_click_screen_position = self.last_cursor_position;
+                        }
+                        self.current_left_mouse_state = *mouse_state;
+                        self.left_mouse_last_transition_time = Instant::now();
+                        return true;
+                    }
+                    MouseButton::Right => {
+                        self.current_right_mouse_state = *mouse_state;
+                        self.right_mouse_last_transition_time = Instant::now();
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
+            WindowEvent::CursorMoved {position,..} => {
+                self.last_cursor_position = *position;
+                return true;
+            }
+            _ => {}
+        }
         false
     }
 
     fn update(&mut self) {
         //todo!()
+        self.window.request_redraw();
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+        self.glyphon_viewport.update(
+            &self.queue,
+            Resolution{
+                width: self.config.width,
+                height: self.config.height,
+            }
+        );
         self.text_renderer.prepare(
             &self.device,
             &self.queue,
             &mut self.font_system,
             &mut self.text_atlas,
-            Resolution {
-                width: self.config.width,
-                height: self.config.height,
-            },
+            &self.glyphon_viewport,
             [TextArea {
+                custom_glyphs: &[],
                 buffer: &self.text_buffer,
                 left: 10.0,
                 top: 10.0,
@@ -462,6 +552,7 @@ impl State<'_> {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    depth_slice: None,
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -479,7 +570,7 @@ impl State<'_> {
                 timestamp_writes: None,
             });
 
-            self.text_renderer.render(&self.text_atlas, &mut render_pass).unwrap();
+            self.text_renderer.render(&self.text_atlas, &self.glyphon_viewport, &mut render_pass).unwrap();
 
 
             render_pass.set_pipeline(&self.grid_render_pipeline);
@@ -539,6 +630,66 @@ pub fn insert_canvas_and_create_log_list(window: &Window) -> web_sys::Element {
     log_list
 }*/
 
+struct App {
+    state: Option<State>,
+}
+
+impl ApplicationHandler for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.state.is_none() {
+            let window_attributes = Window::default_attributes();
+            
+            #[cfg(target_arch = "wasm32")]
+            let window_attributes = {
+                use winit::platform::web::WindowAttributesExtWebSys;
+                window_attributes.with_append(true)
+            };
+
+            let window = Arc::new(event_loop.create_window(window_attributes).unwrap());
+
+            #[cfg(target_arch = "wasm32")]
+            {
+                use winit::dpi::PhysicalSize;
+                let _ = window.request_inner_size(PhysicalSize::new(1024, 1024));
+            }
+
+            let mut state = pollster::block_on(State::new(window));
+            state.load_data();
+            self.state = Some(state);
+        }
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        if let Some(state) = &mut self.state {
+            if window_id == state.window.id() && !state.input(&event) {
+                 match event {
+                    WindowEvent::CloseRequested => {
+                        event_loop.exit();
+                    }
+                    WindowEvent::Resized(physical_size) => {
+                        state.resize(physical_size);
+                    }
+                    WindowEvent::RedrawRequested => {
+                        state.update();
+                        match state.render() {
+                            Ok(_) => {}
+                            Err(wgpu::SurfaceError::Lost) => state.resize(state.size),
+                            Err(wgpu::SurfaceError::OutOfMemory) => event_loop.exit(),
+                            Err(e) => eprintln!("{:?}", e),
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
 #[cfg_attr(target_arch="wasm32", wasm_bindgen(start))]
 pub async fn run() {
     cfg_if::cfg_if! {
@@ -551,127 +702,8 @@ pub async fn run() {
     }
 
     let event_loop = EventLoop::new().unwrap();
-    let builder = WindowBuilder::new();
-    #[cfg(target_arch = "wasm32")]
-        let builder = {
-        use winit::platform::web::WindowBuilderExtWebSys;
-        builder.with_append(true)
-    };
-
-    let window = builder.build(&event_loop).unwrap();
-
-    #[cfg(target_arch = "wasm32")]
-    {
-        // Winit prevents sizing with CSS, so we have to set
-        // the size manually when on web.
-        use winit::dpi::PhysicalSize;
-        let _ = window.request_inner_size(PhysicalSize::new(1024, 1024));
-    }
-
-
-    let mut state = State::new(&window).await;
-
-    let mut last_cursor_position : PhysicalPosition<f64> = Default::default();
-    let mut last_left_click_screen_position : PhysicalPosition<f64> = Default::default();
-
-    let mut current_left_mouse_state : ElementState = ElementState::Released;
-    let mut left_mouse_last_transition_time = Instant::now();
-    let mut left_mouse_last_quick_click_time = Instant::now();
-
-    let mut current_right_mouse_state : ElementState = ElementState::Released;
-    let mut right_mouse_last_transition_time = Instant::now();
-
-    state.load_data();
-
-    event_loop.run(|event, event_loop_window_target| {
-        match event {
-            Event::AboutToWait => {
-                // RedrawRequested will only trigger once unless we manually
-                // request it.
-                window.request_redraw();
-            }
-            Event::WindowEvent {
-                ref event,
-                window_id,
-            } if window_id == window.id() => if !state.input(event) {
-                match event {
-                    WindowEvent::CloseRequested => {event_loop_window_target.exit();}
-                    WindowEvent::MouseWheel{delta, ..} => {
-                        if let LineDelta(x, y) = delta {
-                            let middle = (state.plot_view_frame_value.view_min_x + state.plot_view_frame_value.view_max_x) / 2.0;
-                            let span = (state.plot_view_frame_value.view_max_x - state.plot_view_frame_value.view_min_x) / 2.0;
-                            let new_span = span * (1.0 - (*y/20f32));
-                            state.plot_view_frame_value.view_min_x = middle - new_span;
-                            state.plot_view_frame_value.view_max_x = middle + new_span;
-                        }
-                    }
-                    WindowEvent::MouseInput{state: mouse_state, button, ..} => {
-                        match button {
-                            MouseButton::Left => {
-                                if *mouse_state == ElementState::Released {
-                                    if left_mouse_last_transition_time.elapsed().as_millis() < 200 {
-                                        if left_mouse_last_quick_click_time.elapsed().as_millis() < 500 {
-                                            state.plot_view_frame_value.view_min_x = state.latest_plot_metadata.min_x;
-                                            state.plot_view_frame_value.view_max_x = state.latest_plot_metadata.max_x;
-                                            state.plot_view_frame_value.view_min_y = state.latest_plot_metadata.min_y;
-                                            state.plot_view_frame_value.view_max_y = state.latest_plot_metadata.max_y;
-                                        }
-                                        left_mouse_last_quick_click_time = Instant::now();
-                                    }
-                                    if left_mouse_last_transition_time.elapsed().as_millis() > 200 {
-                                        // Zoom X to selected region
-                                        let start_x_fraction = (last_left_click_screen_position.x/state.size.width as f64);
-                                        let end_x_fraction = (last_cursor_position.x/state.size.width as f64);
-                                        let x_span = state.plot_view_frame_value.view_max_x - state.plot_view_frame_value.view_min_x;
-                                        let start_x = start_x_fraction*x_span as f64 + state.plot_view_frame_value.view_min_x as f64;
-                                        let end_x = end_x_fraction*x_span as f64 + state.plot_view_frame_value.view_min_x as f64;
-                                        state.plot_view_frame_value.view_min_x = start_x as f32;
-                                        state.plot_view_frame_value.view_max_x = end_x as f32;
-                                    }
-                                }
-                                if *mouse_state == ElementState::Pressed {
-                                    last_left_click_screen_position = last_cursor_position;
-                                    dbg!(last_cursor_position);
-                                }
-                                current_left_mouse_state = *mouse_state;
-                                left_mouse_last_transition_time = Instant::now();
-                            }
-                            MouseButton::Right => {
-                                current_right_mouse_state = *mouse_state;
-                                right_mouse_last_transition_time = Instant::now();
-                            }
-                            MouseButton::Middle => {}
-                            MouseButton::Back => {}
-                            MouseButton::Forward => {}
-                            MouseButton::Other(_) => {}
-                        }
-                    }
-                    WindowEvent::CursorMoved {position,..} => {
-                        last_cursor_position = *position;
-                    }
-                    WindowEvent::Resized(physical_size) => {
-                        state.resize(*physical_size);
-                    }
-                    WindowEvent::RedrawRequested => {
-                        state.update();
-                        match state.render() {
-                            Ok(_) => {}
-                            // Reconfigure the surface if lost
-                            Err(wgpu::SurfaceError::Lost) => state.resize(state.size),
-                            // The system is out of memory, we should probably quit
-                            Err(wgpu::SurfaceError::OutOfMemory) => event_loop_window_target.exit(),
-                            // All other errors (Outdated, Timeout) should be resolved by the next frame
-                            Err(e) => eprintln!("{:?}", e),
-                        }
-                    }
-                    WindowEvent::ScaleFactorChanged { inner_size_writer, .. } => {
-                        //state.resize(inner_size_writer);
-                    }
-                    _ => {}
-                }
-            }
-            _ => {}
-        }
-    }).unwrap();
+    event_loop.set_control_flow(ControlFlow::Poll);
+    
+    let mut app = App { state: None };
+    event_loop.run_app(&mut app).unwrap();
 }
-
