@@ -42,7 +42,7 @@ fn vs_grid(
 
     var x2 = ((x - uniform_input.view_min_x)/(uniform_input.view_max_x - uniform_input.view_min_x))*2 - 1;
     var y2 = ((y - uniform_input.view_min_y)/(uniform_input.view_max_y - uniform_input.view_min_y))*2 - 1;
-    out.clip_position = vec4<f32>(model.position.x, model.position.y, 0.0, 1.0);
+    out.clip_position = vec4<f32>(x2, y2, 0.0, 1.0);
     return out;
 }
 

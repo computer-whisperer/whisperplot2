@@ -23,6 +23,9 @@ use winit::{
 };
 use winit::dpi::PhysicalPosition;
 
+mod dataset;
+use crate::dataset::{Dataset, Series};
+
 // On wasm we must not block the main thread or use thread-based primitives.
 // We'll initialize GPU state asynchronously and stash it in a thread-local
 // until the winit event loop can pick it up.
@@ -111,12 +114,20 @@ struct State {
     current_right_mouse_state: ElementState,
     right_mouse_last_transition_time: AppInstant,
     window: Arc<Window>,
+    dataset: Dataset,
 }
 
 impl State {
     // Creating some of the wgpu types requires async code
     async fn new(window: Arc<Window>) -> State {
-        let size = window.inner_size();
+        // On web the canvas can briefly report a 0×0 size during initial layout.
+        // Guard against configuring the surface with zero dimensions.
+        let initial_size = window.inner_size();
+        let size = if initial_size.width == 0 || initial_size.height == 0 {
+            winit::dpi::PhysicalSize::new(1, 1)
+        } else {
+            initial_size
+        };
 
         // The instance is a handle to our GPU
         // Backends::all => Vulkan + Metal + DX12 + Browser WebGPU
@@ -251,7 +262,8 @@ impl State {
         let mut text_renderer = TextRenderer::new(&mut text_atlas, &device, MultisampleState::default(), None);
         let mut text_buffer = glyphon::Buffer::new(&mut font_system, Metrics::new(30.0, 42.0));
 
-        text_buffer.set_size(&mut font_system, Some(size.width as f32), Some(size.height as f32));
+        // Ensure text layout never sees a zero-sized viewport.
+        text_buffer.set_size(&mut font_system, Some(size.width.max(1) as f32), Some(size.height.max(1) as f32));
         text_buffer.set_text(
             &mut font_system,
             "Hello world! 👋\nThis is rendered with 🦅 glyphon 🦁\nThe text below should be partially clipped.\na b c d e f g h i j k l m n o p q r s t u v w x y z",
@@ -404,6 +416,7 @@ impl State {
             left_mouse_last_quick_click_time: AppInstant::now(),
             current_right_mouse_state: ElementState::Released,
             right_mouse_last_transition_time: AppInstant::now(),
+            dataset: Dataset::new(),
         }
     }
 
@@ -423,66 +436,52 @@ impl State {
             let cursor = Cursor::new(bytes);
             csv::ReaderBuilder::new().has_headers(true).delimiter(b',').from_reader(cursor)
         };
-        let mut plot_metadata = PlotMetadata{
-            min_x: 0f32,
-            max_x: 0f32,
-            min_y: 0f32,
-            max_y: 0f32,
-            num_points: 0};
-
-        let mut raw_points: Vec<Vertex> = vec![];
-
-        let mut i = 0;
+        // Read first column as Y, implicit X = index
+        let mut y_vals: Vec<f32> = Vec::new();
         for result in rdr.records() {
             let v = result.unwrap();
-            //let x = v.get(0).unwrap().trim().parse::<f32>().unwrap();
-            let x = i as f32;
             let y = v.get(0).unwrap().trim().parse::<f32>().unwrap();
+            y_vals.push(y);
+        }
 
-            //let y = f32::sin((i as f32)/10000f32);
+        // Build immutable series and insert into dataset
+        let series = Series::from_implicit_y("series0", y_vals);
+        let len = series.y_f32.len();
+        self.dataset.insert(series.name.clone(), series);
 
-            raw_points.push(Vertex{position: [x, y]});
+        // Prepare GPU vertex buffer with positions in data space
+        if let Some(s) = self.dataset.first_series() {
+            let mut raw_points: Vec<Vertex> = Vec::with_capacity(len);
+            for (i, y) in s.y_f32.iter().enumerate() {
+                raw_points.push(Vertex { position: [i as f32, *y] });
+            }
+            self.plot_vertex_buffer = self.device.create_buffer_init(
+                &wgpu::util::BufferInitDescriptor {
+                    label: Some("Vertex Buffer"),
+                    contents: bytemuck::cast_slice(raw_points.as_slice()),
+                    usage: wgpu::BufferUsages::VERTEX,
+                }
+            );
 
-            if i == 0 {
-                plot_metadata.min_x = x;
-                plot_metadata.max_x = x;
-                plot_metadata.min_y = y;
-                plot_metadata.max_y = y;
-            }
-
-            if x < plot_metadata.min_x {
-                plot_metadata.min_x = x;
-            }
-            if x > plot_metadata.max_x {
-                plot_metadata.max_x = x;
-            }
-            if y < plot_metadata.min_y {
-                plot_metadata.min_y = y;
-            }
-            if y > plot_metadata.max_y {
-                plot_metadata.max_y = y;
-            }
-            i += 1;
-        };
-
-        plot_metadata.num_points = i;
-        self.plot_vertex_buffer = self.device.create_buffer_init(
-            &wgpu::util::BufferInitDescriptor {
-                label: Some("Vertex Buffer"),
-                contents: bytemuck::cast_slice(raw_points.as_slice()),
-                usage: wgpu::BufferUsages::VERTEX,
-            }
-        );
-        self.latest_plot_metadata = plot_metadata;
-        self.plot_view_frame_value = PlotViewFrame {
-            full_min_x: plot_metadata.min_x,
-            full_max_x: plot_metadata.max_x,
-            full_min_y: plot_metadata.min_y,
-            full_max_y: plot_metadata.max_y,
-            view_min_x: plot_metadata.min_x,
-            view_max_x: plot_metadata.max_x,
-            view_min_y: plot_metadata.min_y,
-            view_max_y: plot_metadata.max_y
+            // Update metadata and view
+            let plot_metadata = PlotMetadata{
+                min_x: s.min_x as f32,
+                max_x: s.max_x as f32,
+                min_y: s.min_y,
+                max_y: s.max_y,
+                num_points: len as u32,
+            };
+            self.latest_plot_metadata = plot_metadata;
+            self.plot_view_frame_value = PlotViewFrame {
+                full_min_x: self.dataset.full_min_x as f32,
+                full_max_x: self.dataset.full_max_x as f32,
+                full_min_y: self.dataset.full_min_y,
+                full_max_y: self.dataset.full_max_y,
+                view_min_x: self.dataset.full_min_x as f32,
+                view_max_x: self.dataset.full_max_x as f32,
+                view_min_y: self.dataset.full_min_y,
+                view_max_y: self.dataset.full_max_y,
+            };
         }
     }
 
@@ -492,6 +491,8 @@ impl State {
             self.config.width = new_size.width;
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
+            // Keep text layout in sync with window size
+            self.text_buffer.set_size(&mut self.font_system, Some(self.config.width as f32), Some(self.config.height as f32));
         }
     }
 
@@ -561,11 +562,18 @@ impl State {
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+        // If the surface has zero size (can happen transiently on web), skip rendering this frame.
+        if self.config.width == 0 || self.config.height == 0 {
+            return Ok(());
+        }
+        // Update hot uniforms BEFORE encoding draw calls
+        self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[self.plot_view_frame_value]));
+
         self.glyphon_viewport.update(
             &self.queue,
             Resolution{
-                width: self.config.width,
-                height: self.config.height,
+                width: self.config.width.max(1),
+                height: self.config.height.max(1),
             }
         );
         self.text_renderer.prepare(
@@ -620,9 +628,6 @@ impl State {
                 timestamp_writes: None,
             });
 
-            self.text_renderer.render(&self.text_atlas, &self.glyphon_viewport, &mut render_pass).unwrap();
-
-
             render_pass.set_pipeline(&self.grid_render_pipeline);
             render_pass.set_vertex_buffer(0, self.grid_vertex_buffer.slice(..));
             render_pass.set_bind_group(0, &self.uniform_buffer_bind_group, &[]);
@@ -633,11 +638,13 @@ impl State {
             render_pass.set_bind_group(0, &self.uniform_buffer_bind_group, &[]);
             render_pass.draw(0..self.latest_plot_metadata.num_points, 0..1);
 
+            // Render text last to ensure it draws on top
+            self.text_renderer.render(&self.text_atlas, &self.glyphon_viewport, &mut render_pass).unwrap();
+
 
         }
 
         // submit will accept anything that implements IntoIter
-        self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[self.plot_view_frame_value]));
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
 
