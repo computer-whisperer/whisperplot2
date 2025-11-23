@@ -3,6 +3,12 @@
 name = "whisperplot"
 version = "0.1.0"
 edition = "2024"
+description = "GPU-accelerated time-series explorer for very large datasets (CSV/Parquet), targeting Linux native and WebGPU."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["plot", "time-series", "wgpu", "webgpu", "visualization"]
+# crates.io categories (keep to widely valid ones)
+categories = ["visualization", "graphics"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
