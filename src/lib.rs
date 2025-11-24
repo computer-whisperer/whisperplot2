@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::io::Cursor;
 use bytemuck::{Pod, Zeroable};
 use glyphon::{FontSystem, SwashCache, TextAtlas, TextRenderer, Metrics, Attrs, Family, Shaping, Resolution, TextArea, TextBounds, Cache};
-use wgpu::{Backends, MultisampleState, RenderPass};
+use wgpu::{MultisampleState};
 use wgpu::util::DeviceExt;
 #[cfg(target_arch="wasm32")]
 use wasm_bindgen::prelude::*;
@@ -89,21 +89,18 @@ struct Vertex {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 struct GridLevelUniform {
-    x_first: f32,
-    x_step: f32,
-    x_count: u32,
-    _pad0: u32,
-    y_first: f32,
-    y_step: f32,
-    y_count: u32,
-    orient: u32,
+    // Single tick series: first + i*step, i in [0, count)
+    first: f32,
+    step: f32,
+    count: u32,
+    orient: u32, // 0 = vertical lines, 1 = horizontal lines
     alpha: f32,
-    // Pad to 64 bytes total to match WGSL/std140 expectations.
-    _pad1: [f32; 7],
+    // Pad to 48 bytes total to match WGSL uniform layout (vec3 alignment bumps struct size to 48)
+    _pad: [f32; 7],
 }
 
 // Compile-time size check to prevent uniform size regressions.
-const _: [(); 64] = [(); std::mem::size_of::<GridLevelUniform>()];
+const _: [(); 48] = [(); std::mem::size_of::<GridLevelUniform>()];
 
 struct State {
     surface: wgpu::Surface<'static>,
@@ -119,6 +116,11 @@ struct State {
     uniform_buffer: wgpu::Buffer,
     uniform_buffer_bind_group: wgpu::BindGroup,
     grid_level_uniform_buffer: wgpu::Buffer,
+    // Dynamic uniform buffering for per-level grid parameters
+    grid_dyn_stride: u64,              // aligned stride for GridLevelUniform
+    grid_per_frame_capacity: u32,      // number of level uniforms per frame slice
+    grid_frames: u32,                  // ring buffer frames (e.g., 3)
+    frame_index: u64,                  // monotonically increasing frame counter
     latest_plot_metadata: PlotMetadata,
     plot_view_frame_value: PlotViewFrame,
     text_renderer: TextRenderer,
@@ -137,7 +139,6 @@ struct State {
     right_mouse_last_transition_time: AppInstant,
     window: Arc<Window>,
     dataset: Dataset,
-    last_debug_log: AppInstant,
 }
 
 impl State {
@@ -230,17 +231,21 @@ impl State {
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
 
-        let grid_level_uniform_buffer = device.create_buffer_init(
-            &wgpu::util::BufferInitDescriptor {
-                label: Some("Grid Level Uniform Buffer"),
-                contents: bytemuck::cast_slice(&[GridLevelUniform{
-                    x_first: 0.0, x_step: 1.0, x_count: 0, _pad0: 0,
-                    y_first: 0.0, y_step: 1.0, y_count: 0, orient: 0,
-                    alpha: 1.0, _pad1: [0.0;7],
-                }]),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            }
-        );
+        // Dynamic uniform buffer for grid levels: allocate a ring buffer with
+        // multiple frame slices to avoid write-after-use hazards across frames.
+        let limits = device.limits();
+        let align = limits.min_uniform_buffer_offset_alignment as u64;
+        let raw = std::mem::size_of::<GridLevelUniform>() as u64;
+        let grid_dyn_stride = ((raw + align - 1) / align) * align;
+        let grid_per_frame_capacity: u32 = 16; // up to 16 grid levels per frame (X+Y combined)
+        let grid_frames: u32 = 3;              // triple buffering
+        let total_grid_bytes = grid_dyn_stride * grid_per_frame_capacity as u64 * grid_frames as u64;
+        let grid_level_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Grid Level Uniform Buffer (dynamic)"),
+            size: total_grid_bytes,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         let uniform_buffer_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             entries: &[
@@ -259,7 +264,9 @@ impl State {
                     visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
+                        // Use dynamic offsets to bind per-level grid parameters without
+                        // rewriting the same buffer region between draws within a pass.
+                        has_dynamic_offset: true,
                         min_binding_size: std::num::NonZeroU64::new(std::mem::size_of::<GridLevelUniform>() as u64),
                     },
                     count: None,
@@ -277,7 +284,12 @@ impl State {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: grid_level_uniform_buffer.as_entire_binding(),
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &grid_level_uniform_buffer,
+                        offset: 0,
+                        // Bind a fixed-size window so dynamic offsets can advance within the buffer
+                        size: std::num::NonZeroU64::new(std::mem::size_of::<GridLevelUniform>() as u64),
+                    }),
                 },
             ],
             label: Some("uniform_buffer_bind_group"),
@@ -305,10 +317,10 @@ impl State {
         surface.configure(&device, &config);
 
         let mut font_system = init_font_system();
-        let mut text_cache = SwashCache::new();
+        let text_cache = SwashCache::new();
         let mut cache = Cache::new(&device);
         let mut text_atlas = TextAtlas::new(&device, &queue, &cache, surface_format);
-        let mut text_renderer = TextRenderer::new(&mut text_atlas, &device, MultisampleState::default(), None);
+        let text_renderer = TextRenderer::new(&mut text_atlas, &device, MultisampleState::default(), None);
         let mut text_buffer = glyphon::Buffer::new(&mut font_system, Metrics::new(30.0, 42.0));
 
         // Ensure text layout never sees a zero-sized viewport.
@@ -452,6 +464,10 @@ impl State {
             uniform_buffer,
             uniform_buffer_bind_group,
             grid_level_uniform_buffer,
+            grid_dyn_stride,
+            grid_per_frame_capacity,
+            grid_frames,
+            frame_index: 0,
             latest_plot_metadata: PlotMetadata {.. Default::default() },
             plot_view_frame_value: PlotViewFrame {.. Default::default() },
             text_renderer,
@@ -467,7 +483,6 @@ impl State {
             current_right_mouse_state: ElementState::Released,
             right_mouse_last_transition_time: AppInstant::now(),
             dataset: Dataset::new(),
-            last_debug_log: AppInstant::now(),
         }
     }
 
@@ -690,78 +705,49 @@ impl State {
                 self.config.height,
             );
 
-            // Periodic debug dump of grid plan to diagnose missing verticals / dense horizontals
-            if self.last_debug_log.elapsed().as_millis() > 500 {
-                let vx = plan.x.len();
-                let vy = plan.y.len();
-                eprintln!(
-                    "[grid debug] view_x:[{:.3},{:.3}] view_y:[{:.3},{:.3}] size:{}x{} | levels X:{} Y:{}",
-                    self.plot_view_frame_value.view_min_x,
-                    self.plot_view_frame_value.view_max_x,
-                    self.plot_view_frame_value.view_min_y,
-                    self.plot_view_frame_value.view_max_y,
-                    self.config.width,
-                    self.config.height,
-                    vx,
-                    vy
-                );
-                if let Some(l) = plan.x.get(0) {
-                    eprintln!("[grid debug] X0 first:{:.3} step:{:.3} count:{} alpha:{:.2}", l.first, l.step, l.count, l.alpha);
-                }
-                if let Some(l) = plan.x.get(1) {
-                    eprintln!("[grid debug] X1 first:{:.3} step:{:.3} count:{} alpha:{:.2}", l.first, l.step, l.count, l.alpha);
-                }
-                if let Some(l) = plan.y.get(0) {
-                    eprintln!("[grid debug] Y0 first:{:.3} step:{:.3} count:{} alpha:{:.2}", l.first, l.step, l.count, l.alpha);
-                }
-                if let Some(l) = plan.y.get(1) {
-                    eprintln!("[grid debug] Y1 first:{:.3} step:{:.3} count:{} alpha:{:.2}", l.first, l.step, l.count, l.alpha);
-                }
-                self.last_debug_log = AppInstant::now();
-            }
+            // Debug logging removed after stabilization
 
             render_pass.set_pipeline(&self.grid_render_pipeline);
             render_pass.set_vertex_buffer(0, self.grid_vertex_buffer.slice(..));
-            render_pass.set_bind_group(0, &self.uniform_buffer_bind_group, &[]);
+
+            // Compute frame slice base offset for dynamic uniform buffering
+            let frame_slot = (self.frame_index % self.grid_frames as u64) as u32;
+            let base_offset = (frame_slot as u64) * (self.grid_per_frame_capacity as u64) * self.grid_dyn_stride;
+            let mut slot: u32 = 0;
+
+            // Helper to bind and draw a level with orientation
+            let mut draw_level = |lvl: &crate::view::TickLevel, orient: u32, render_pass: &mut wgpu::RenderPass| {
+                if slot >= self.grid_per_frame_capacity { return; } // safety clamp
+                let u = GridLevelUniform {
+                    first: lvl.first,
+                    step: lvl.step,
+                    count: lvl.count,
+                    orient,
+                    alpha: lvl.alpha,
+                    _pad: [0.0; 7],
+                };
+                let offset_bytes = base_offset + (slot as u64) * self.grid_dyn_stride;
+                self.queue.write_buffer(&self.grid_level_uniform_buffer, offset_bytes, bytemuck::bytes_of(&u));
+                // Bind group 0 expects one dynamic offset (for binding 1)
+                let dyn_offset = offset_bytes as u32;
+                render_pass.set_bind_group(0, &self.uniform_buffer_bind_group, &[dyn_offset]);
+                render_pass.draw(0..self.grid_vertex_count as u32, 0..lvl.count);
+                slot += 1;
+            };
 
             // Draw X-axis vertical lines (coarse to fine as given)
-            for lvl in plan.x.iter() {
-                let u = GridLevelUniform{
-                    x_first: lvl.first, x_step: lvl.step, x_count: lvl.count, _pad0: 0,
-                    y_first: 0.0, y_step: 1.0, y_count: 0, orient: 0,
-                    alpha: lvl.alpha, _pad1: [0.0;7],
-                };
-                self.queue.write_buffer(&self.grid_level_uniform_buffer, 0, bytemuck::bytes_of(&u));
-                render_pass.draw(0..self.grid_vertex_count as u32, 0..lvl.count);
-            }
-
+            for lvl in plan.x.iter() { draw_level(lvl, 0, &mut render_pass); }
             // Draw Y-axis horizontal lines
-            for lvl in plan.y.iter() {
-                let u = GridLevelUniform{
-                    x_first: 0.0, x_step: 1.0, x_count: 0, _pad0: 0,
-                    y_first: lvl.first, y_step: lvl.step, y_count: lvl.count, orient: 1,
-                    alpha: lvl.alpha, _pad1: [0.0;7],
-                };
-                self.queue.write_buffer(&self.grid_level_uniform_buffer, 0, bytemuck::bytes_of(&u));
-                render_pass.draw(0..self.grid_vertex_count as u32, 0..lvl.count);
-            }
+            for lvl in plan.y.iter() { draw_level(lvl, 1, &mut render_pass); }
 
-            // Optional: debug sanity vertical line at center x
-            const DEBUG_FORCE_CENTER_VERTICAL: bool = false;
-            if DEBUG_FORCE_CENTER_VERTICAL {
-                let center_x = (self.plot_view_frame_value.view_min_x + self.plot_view_frame_value.view_max_x) * 0.5;
-                let u = GridLevelUniform{
-                    x_first: center_x, x_step: 1.0, x_count: 1, _pad0: 0,
-                    y_first: 0.0, y_step: 1.0, y_count: 0, orient: 0,
-                    alpha: 1.0, _pad1: [0.0;7],
-                };
-                self.queue.write_buffer(&self.grid_level_uniform_buffer, 0, bytemuck::bytes_of(&u));
-                render_pass.draw(0..self.grid_vertex_count as u32, 0..1);
-            }
+            // Removed debug-only forced center line
 
             render_pass.set_pipeline(&self.plot_render_pipeline);
             render_pass.set_vertex_buffer(0, self.plot_vertex_buffer.slice(..));
-            render_pass.set_bind_group(0, &self.uniform_buffer_bind_group, &[]);
+            // Bind with a valid dynamic offset for binding(1) even though the plot pipeline
+            // doesn't read it, because the layout declares it dynamic.
+            let dyn_offset = base_offset as u32;
+            render_pass.set_bind_group(0, &self.uniform_buffer_bind_group, &[dyn_offset]);
             render_pass.draw(0..self.latest_plot_metadata.num_points, 0..1);
 
             // Render text last to ensure it draws on top
@@ -773,6 +759,9 @@ impl State {
         // submit will accept anything that implements IntoIter
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
+
+        // Advance frame ring index after submitting work
+        self.frame_index = self.frame_index.wrapping_add(1);
 
         Ok(())
     }
