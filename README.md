@@ -62,6 +62,23 @@ Current snapshot (as of 2025‑11‑23)
   - Cargo.toml config uses `wgpu = 27` for native but `wgpu = 0.19` under wasm target with `webgl` feature; these versions are incompatible. We need a unified version strategy and a WebGPU path. Until then, web builds may not function reliably.
   - Single monolithic crate; no clear module boundaries for data adapters, render core, and frontends yet.
 
+Fractal ticks and grid (new)
+
+- Stateless, deterministic tick planning each frame using a 1–2–5 × 10^k ladder.
+- Multiple adjacent tick levels (coarse → fine) are evaluated; their visibility fades in/out smoothly as zoom changes using `smoothstep` on pixel spacing thresholds.
+- Grid is drawn via instancing using a tiny per‑level uniform buffer; no per‑frame large VB rebuilds.
+- Coarser levels draw first, finer levels on top with alpha blending to avoid “popping.”
+- This lays the groundwork for axis labels at the selected “label level” (coarsest level with ≥ ~80 px spacing).
+
+Uniform alignment note (native validation fix)
+
+- The per-level grid uniform (`GridLevelUniform`) must be 64 bytes due to WGSL/std140‑like alignment rules on uniform buffers (16‑byte alignment; `vec3<f32>` rounds up to 16 bytes).
+- A mismatch between Rust struct size and WGSL struct size will trigger wgpu validation errors like: “Buffer is bound with size 48 where the shader expects 64 in group[0] binding[1]”.
+- Fix implemented:
+  - Rust: `#[repr(C)]` `GridLevelUniform` explicitly padded to 64 bytes; compile‑time size assert added.
+  - WGSL: trailing padding upgraded to `vec4<f32>`.
+  - Bind group layout enforces `min_binding_size = 64` for that binding to catch regressions early.
+
 Architecture (planned)
 
 Target decomposition (suggested workspace crates):

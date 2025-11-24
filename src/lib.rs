@@ -25,6 +25,8 @@ use winit::dpi::PhysicalPosition;
 
 mod dataset;
 use crate::dataset::{Dataset, Series};
+mod view;
+use crate::view::plan_grid;
 
 // On wasm we must not block the main thread or use thread-based primitives.
 // We'll initialize GPU state asynchronously and stash it in a thread-local
@@ -84,6 +86,25 @@ struct Vertex {
     position: [f32; 2]
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+struct GridLevelUniform {
+    x_first: f32,
+    x_step: f32,
+    x_count: u32,
+    _pad0: u32,
+    y_first: f32,
+    y_step: f32,
+    y_count: u32,
+    orient: u32,
+    alpha: f32,
+    // Pad to 64 bytes total to match WGSL/std140 expectations.
+    _pad1: [f32; 7],
+}
+
+// Compile-time size check to prevent uniform size regressions.
+const _: [(); 64] = [(); std::mem::size_of::<GridLevelUniform>()];
+
 struct State {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -93,10 +114,11 @@ struct State {
     plot_render_pipeline: wgpu::RenderPipeline,
     grid_render_pipeline: wgpu::RenderPipeline,
     plot_vertex_buffer: wgpu::Buffer,
-    grid_vertex_buffer: wgpu::Buffer,
-    grid_vertex_count: usize,
+    grid_vertex_buffer: wgpu::Buffer, // unit line vertices for instanced grid
+    grid_vertex_count: usize,         // should be 2
     uniform_buffer: wgpu::Buffer,
     uniform_buffer_bind_group: wgpu::BindGroup,
+    grid_level_uniform_buffer: wgpu::Buffer,
     latest_plot_metadata: PlotMetadata,
     plot_view_frame_value: PlotViewFrame,
     text_renderer: TextRenderer,
@@ -115,6 +137,7 @@ struct State {
     right_mouse_last_transition_time: AppInstant,
     window: Arc<Window>,
     dataset: Dataset,
+    last_debug_log: AppInstant,
 }
 
 impl State {
@@ -160,7 +183,7 @@ impl State {
             },
         ).await.unwrap();
 
-        const VERTICES: &[Vertex] = &[
+        const PLOT_VERTICES: &[Vertex] = &[
             Vertex { position: [0.0, 0.5]},
             Vertex { position: [-0.5, -0.5]},
             Vertex { position: [0.5, -0.5]},
@@ -169,24 +192,24 @@ impl State {
         let plot_vertex_buffer = device.create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
                 label: Some("Plot Vertex Buffer"),
-                contents: bytemuck::cast_slice(VERTICES),
+                contents: bytemuck::cast_slice(PLOT_VERTICES),
                 usage: wgpu::BufferUsages::VERTEX,
             }
         );
 
-        let mut grid_vertexes: Vec::<Vertex> = vec![];
-        let num_per_side = 30;
-        for i in 0..num_per_side {
-            grid_vertexes.push(Vertex { position: [(i as f32)/num_per_side as f32, 0.0] });
-            grid_vertexes.push(Vertex { position: [(i as f32)/num_per_side as f32, 1.0] });
-            grid_vertexes.push(Vertex { position: [0.0, (i as f32)/num_per_side as f32] });
-            grid_vertexes.push(Vertex { position: [1.0, (i as f32)/num_per_side as f32] });
-        }
+        // Grid unit vertices: two vertices spanning -1..+1 along X, Y=0.
+        // Shader uses model.position.x as the varying coordinate for both orientations:
+        //   - vertical: y_ndc = model.position.x, x_ndc comes from instance x_tick
+        //   - horizontal: x_ndc = model.position.x, y_ndc comes from instance y_tick
+        const GRID_UNIT_VERTICES: &[Vertex] = &[
+            Vertex { position: [-1.0,  0.0] },
+            Vertex { position: [ 1.0,  0.0] },
+        ];
 
         let grid_vertex_buffer = device.create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
-                label: Some("Grid Vertex Buffer"),
-                contents: bytemuck::cast_slice(grid_vertexes.as_slice()),
+                label: Some("Grid Unit Vertex Buffer"),
+                contents: bytemuck::cast_slice(GRID_UNIT_VERTICES),
                 usage: wgpu::BufferUsages::VERTEX,
             }
         );
@@ -207,6 +230,18 @@ impl State {
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
 
+        let grid_level_uniform_buffer = device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("Grid Level Uniform Buffer"),
+                contents: bytemuck::cast_slice(&[GridLevelUniform{
+                    x_first: 0.0, x_step: 1.0, x_count: 0, _pad0: 0,
+                    y_first: 0.0, y_step: 1.0, y_count: 0, orient: 0,
+                    alpha: 1.0, _pad1: [0.0;7],
+                }]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            }
+        );
+
         let uniform_buffer_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             entries: &[
                 wgpu::BindGroupLayoutEntry {
@@ -218,7 +253,17 @@ impl State {
                         min_binding_size: None,
                     },
                     count: None,
-                }
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: std::num::NonZeroU64::new(std::mem::size_of::<GridLevelUniform>() as u64),
+                    },
+                    count: None,
+                },
             ],
             label: Some("uniform_buffer_bind_group_layout"),
         });
@@ -229,7 +274,11 @@ impl State {
                 wgpu::BindGroupEntry {
                     binding: 0,
                     resource: uniform_buffer.as_entire_binding(),
-                }
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: grid_level_uniform_buffer.as_entire_binding(),
+                },
             ],
             label: Some("uniform_buffer_bind_group"),
         });
@@ -365,7 +414,7 @@ impl State {
                 entry_point: Some("fs_grid"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: config.format,
-                    blend: Some(wgpu::BlendState::REPLACE),
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })]
             }),
@@ -399,9 +448,10 @@ impl State {
             grid_render_pipeline,
             plot_vertex_buffer,
             grid_vertex_buffer,
-            grid_vertex_count: grid_vertexes.len(),
+            grid_vertex_count: 2,
             uniform_buffer,
             uniform_buffer_bind_group,
+            grid_level_uniform_buffer,
             latest_plot_metadata: PlotMetadata {.. Default::default() },
             plot_view_frame_value: PlotViewFrame {.. Default::default() },
             text_renderer,
@@ -417,6 +467,7 @@ impl State {
             current_right_mouse_state: ElementState::Released,
             right_mouse_last_transition_time: AppInstant::now(),
             dataset: Dataset::new(),
+            last_debug_log: AppInstant::now(),
         }
     }
 
@@ -528,8 +579,9 @@ impl State {
                                 let x_span = self.plot_view_frame_value.view_max_x - self.plot_view_frame_value.view_min_x;
                                 let start_x = start_x_fraction * x_span as f64 + self.plot_view_frame_value.view_min_x as f64;
                                 let end_x = end_x_fraction * x_span as f64 + self.plot_view_frame_value.view_min_x as f64;
-                                self.plot_view_frame_value.view_min_x = start_x as f32;
-                                self.plot_view_frame_value.view_max_x = end_x as f32;
+                                let (lo, hi) = if start_x <= end_x { (start_x as f32, end_x as f32) } else { (end_x as f32, start_x as f32) };
+                                self.plot_view_frame_value.view_min_x = lo;
+                                self.plot_view_frame_value.view_max_x = hi;
                             }
                         }
                         if *mouse_state == ElementState::Pressed {
@@ -628,10 +680,84 @@ impl State {
                 timestamp_writes: None,
             });
 
+            // Plan fractal ticks for current view and size (stateless)
+            let plan = plan_grid(
+                self.plot_view_frame_value.view_min_x,
+                self.plot_view_frame_value.view_max_x,
+                self.plot_view_frame_value.view_min_y,
+                self.plot_view_frame_value.view_max_y,
+                self.config.width,
+                self.config.height,
+            );
+
+            // Periodic debug dump of grid plan to diagnose missing verticals / dense horizontals
+            if self.last_debug_log.elapsed().as_millis() > 500 {
+                let vx = plan.x.len();
+                let vy = plan.y.len();
+                eprintln!(
+                    "[grid debug] view_x:[{:.3},{:.3}] view_y:[{:.3},{:.3}] size:{}x{} | levels X:{} Y:{}",
+                    self.plot_view_frame_value.view_min_x,
+                    self.plot_view_frame_value.view_max_x,
+                    self.plot_view_frame_value.view_min_y,
+                    self.plot_view_frame_value.view_max_y,
+                    self.config.width,
+                    self.config.height,
+                    vx,
+                    vy
+                );
+                if let Some(l) = plan.x.get(0) {
+                    eprintln!("[grid debug] X0 first:{:.3} step:{:.3} count:{} alpha:{:.2}", l.first, l.step, l.count, l.alpha);
+                }
+                if let Some(l) = plan.x.get(1) {
+                    eprintln!("[grid debug] X1 first:{:.3} step:{:.3} count:{} alpha:{:.2}", l.first, l.step, l.count, l.alpha);
+                }
+                if let Some(l) = plan.y.get(0) {
+                    eprintln!("[grid debug] Y0 first:{:.3} step:{:.3} count:{} alpha:{:.2}", l.first, l.step, l.count, l.alpha);
+                }
+                if let Some(l) = plan.y.get(1) {
+                    eprintln!("[grid debug] Y1 first:{:.3} step:{:.3} count:{} alpha:{:.2}", l.first, l.step, l.count, l.alpha);
+                }
+                self.last_debug_log = AppInstant::now();
+            }
+
             render_pass.set_pipeline(&self.grid_render_pipeline);
             render_pass.set_vertex_buffer(0, self.grid_vertex_buffer.slice(..));
             render_pass.set_bind_group(0, &self.uniform_buffer_bind_group, &[]);
-            render_pass.draw(0..self.grid_vertex_count as u32, 0..1);
+
+            // Draw X-axis vertical lines (coarse to fine as given)
+            for lvl in plan.x.iter() {
+                let u = GridLevelUniform{
+                    x_first: lvl.first, x_step: lvl.step, x_count: lvl.count, _pad0: 0,
+                    y_first: 0.0, y_step: 1.0, y_count: 0, orient: 0,
+                    alpha: lvl.alpha, _pad1: [0.0;7],
+                };
+                self.queue.write_buffer(&self.grid_level_uniform_buffer, 0, bytemuck::bytes_of(&u));
+                render_pass.draw(0..self.grid_vertex_count as u32, 0..lvl.count);
+            }
+
+            // Draw Y-axis horizontal lines
+            for lvl in plan.y.iter() {
+                let u = GridLevelUniform{
+                    x_first: 0.0, x_step: 1.0, x_count: 0, _pad0: 0,
+                    y_first: lvl.first, y_step: lvl.step, y_count: lvl.count, orient: 1,
+                    alpha: lvl.alpha, _pad1: [0.0;7],
+                };
+                self.queue.write_buffer(&self.grid_level_uniform_buffer, 0, bytemuck::bytes_of(&u));
+                render_pass.draw(0..self.grid_vertex_count as u32, 0..lvl.count);
+            }
+
+            // Optional: debug sanity vertical line at center x
+            const DEBUG_FORCE_CENTER_VERTICAL: bool = false;
+            if DEBUG_FORCE_CENTER_VERTICAL {
+                let center_x = (self.plot_view_frame_value.view_min_x + self.plot_view_frame_value.view_max_x) * 0.5;
+                let u = GridLevelUniform{
+                    x_first: center_x, x_step: 1.0, x_count: 1, _pad0: 0,
+                    y_first: 0.0, y_step: 1.0, y_count: 0, orient: 0,
+                    alpha: 1.0, _pad1: [0.0;7],
+                };
+                self.queue.write_buffer(&self.grid_level_uniform_buffer, 0, bytemuck::bytes_of(&u));
+                render_pass.draw(0..self.grid_vertex_count as u32, 0..1);
+            }
 
             render_pass.set_pipeline(&self.plot_render_pipeline);
             render_pass.set_vertex_buffer(0, self.plot_vertex_buffer.slice(..));
@@ -708,8 +834,9 @@ impl ApplicationHandler for App {
 
             #[cfg(target_arch = "wasm32")]
             {
-                use winit::dpi::PhysicalSize;
-                let _ = window.request_inner_size(PhysicalSize::new(1024, 1024));
+                // Let CSS control the canvas size (index.html sets canvas to fill the viewport).
+                // Avoid forcing a fixed inner size on the web; winit will emit Resized events
+                // as the canvas/layout changes, and our resize path will reconfigure the surface.
             }
 
             #[cfg(target_arch = "wasm32")]

@@ -5,10 +5,21 @@
     <meta charset="UTF-8">
     <meta http-equiv="X-UA-Compatible" content="IE=edge">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Learn WGPU</title>
+    <title>Whisperplot (WebGPU)</title>
     <style>
+        html, body {
+            width: 100%;
+            height: 100%;
+            margin: 0;
+            padding: 0;
+        }
+
+        /* Make the winit-managed canvas fill the entire viewport */
         canvas {
-            background-color: black;
+            display: block;              /* remove inline gap */
+            width: 100%;
+            height: 100%;
+            background-color: black;     /* fallback clear */
         }
     </style>
 </head>
